@@ -98,8 +98,11 @@ class UMLSClient:
         request_fingerprint = hashlib.sha256(
             json.dumps([path, safe_params], sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:16]
+        response_fingerprint = hashlib.sha256(content).hexdigest()[:16]
         endpoint = re.sub(r"[^a-zA-Z0-9._-]+", "-", path).strip("-")
-        output_path = self.raw_dir / f"{endpoint}-{request_fingerprint}.json"
+        output_path = self.raw_dir / (
+            f"{endpoint}-{request_fingerprint}-{response_fingerprint}.json"
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(content)
 

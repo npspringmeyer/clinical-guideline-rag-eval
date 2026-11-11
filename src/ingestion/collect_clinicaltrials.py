@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -50,7 +51,10 @@ def collect_studies(
         seen_ids: set[str] = set()
         for page in client.iter_study_pages(query, result_limit, page_size):
             page_count += 1
-            raw_path = raw_dir / f"{_slug(label)}-page-{page_count:04d}.json"
+            page_hash = hashlib.sha256(page.raw_content).hexdigest()[:16]
+            raw_path = raw_dir / (
+                f"{_slug(label)}-page-{page_count:04d}-{page_hash}.json"
+            )
             raw_path.write_bytes(page.raw_content)
             for study in page.payload.get("studies", []):
                 document = study_to_document(study)

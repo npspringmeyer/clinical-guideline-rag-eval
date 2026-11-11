@@ -26,9 +26,10 @@ python scripts/collect_clinicaltrials.py \
 `--condition`, `--intervention`, and `--query-term` are repeatable. Additional
 supported API v2 parameters can be passed as `--query-param KEY=VALUE`.
 Pagination follows the API's `nextPageToken`; requests have timeouts, bounded
-retries, and rate-limit handling. Raw page responses are retained under
-`data/raw/clinicaltrials/`, and normalized records are written under
-`data/processed/clinicaltrials/`.
+retries, and rate-limit handling. Raw API response snapshots use content-derived
+filenames and are retained under
+`data/raw/clinicaltrials/`, and normalized documents using the shared schema
+are written under `data/processed/clinicaltrials/`.
 
 UMLS terminology enrichment is optional and uses the REST API only. Set
 `UMLS_API_KEY` in the environment (never in a checked-in file) before running:
@@ -42,13 +43,15 @@ python scripts/enrich_umls.py --query 'high blood pressure' \
 
 Use `--release` to choose a UMLS release (default: `current`), and
 `--document-id` to associate results with source document IDs. Exact UMLS API
-JSON responses are saved under `data/raw/umls/`; normalized terminology output
+JSON responses are saved under `data/raw/umls/` using filenames derived from
+the request parameters and response content; normalized terminology output
 is a separate enrichment layer at `data/processed/umls/enrichment.jsonl`. It
 retains the original query, all returned candidate CUIs, preferred terms,
 semantic types, terminology sources, and the release. Raw response filenames
-are derived from the endpoint and a hash of non-secret request parameters; the
-API key is not written to disk. Query expansion is opt-in and never replaces
-the original query or resolves ambiguity by selecting a single candidate.
+are derived from the endpoint, a hash of non-secret request parameters, and a
+hash of response content; the API key is not written to disk. Query expansion
+is opt-in and never replaces the original query or resolves ambiguity by
+selecting a single candidate.
 UMLS terminology is metadata, not clinical evidence. Access, storage, and
 redistribution of UMLS data and derivatives are subject to the UMLS license
 and the licenses of the source vocabularies available to the account. Raw and
@@ -59,11 +62,21 @@ processed outputs are git-ignored; review rights before sharing either.
 `src/models/document.py` defines the common normalized document fields:
 stable `doc_id`, source, document type, title, section, source URL, retrieval
 timestamp, source update date, source version, content, metadata, and a
-SHA-256 content hash. `data/manifest.csv` keeps its original columns and adds
+SHA-256 content hash. All evidence-source normalized documents use this schema
+as JSON under `data/processed/<source>/`; `data/raw/` holds source responses
+(MedlinePlus XML, openFDA label JSON, and API responses). `data/manifest.csv`
+keeps its original columns and adds
 the standardized type, section, update date, raw path, content hash, and
 source-specific metadata columns. The legacy `sha256` column remains for
-compatibility. Existing MedlinePlus/openFDA records are upgraded with available
-provenance when the existing downloader next runs.
+compatibility. The downloader migrates existing openFDA text files and the
+cached MedlinePlus query XML into the processed schema and manifest without
+refetching those records. New MedlinePlus query snapshots and openFDA label
+records also use content-derived filenames so later downloads do not overwrite
+raw inputs referenced by earlier manifest rows. MedlinePlus captures did not
+retain an API retrieval timestamp, so their migration records the local XML
+file modification time as the capture-time estimate and leaves the source
+update date blank (the source `date-created` attribute is preserved as
+metadata, not misrepresented as an update date).
 
 Clinical trial registrations and any reported registry results are explicitly
 identified as registry information, not published evidence or proof of
