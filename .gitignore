@@ -159,6 +159,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Raw Data
+# Raw data stays out of git; you commit the scripts that fetch it.
+data/raw/
+
 # Spyder project settings
 .spyderproject
 .spyproject
