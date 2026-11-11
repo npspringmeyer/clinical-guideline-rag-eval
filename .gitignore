@@ -162,6 +162,8 @@ venv.bak/
 # Raw Data
 # Raw data stays out of git; you commit the scripts that fetch it.
 data/raw/
+# Processed corpora and UMLS-derived terminology may have redistribution restrictions.
+data/processed/
 
 # Spyder project settings
 .spyderproject

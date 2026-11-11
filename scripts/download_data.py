@@ -28,8 +28,6 @@ Optional: set OPENFDA_API_KEY in your environment for higher rate limits.
 from __future__ import annotations
 
 import argparse
-import csv
-import hashlib
 import html
 import json
 import os
@@ -43,6 +41,10 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from src.ingestion.manifest import document_manifest_row, load_manifest, save_manifest
+from src.models.document import Document
+
 RAW_DIR = ROOT / "data" / "raw"
 MANIFEST_PATH = ROOT / "data" / "manifest.csv"
 
@@ -115,19 +117,6 @@ LABEL_SECTIONS = [
     ("overdosage", "Overdosage"),
 ]
 
-MANIFEST_FIELDS = [
-    "doc_id",
-    "source",
-    "topic_area",
-    "title",
-    "url",
-    "source_version",
-    "retrieved_utc",
-    "license_note",
-    "local_path",
-    "sha256",
-]
-
 # --- Helpers ---------------------------------------------------------------
 
 
@@ -137,10 +126,6 @@ def now_utc() -> str:
 
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
-
-
-def sha256_of(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def rel(path: Path) -> str:
@@ -180,22 +165,6 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def load_manifest() -> dict[str, dict]:
-    if not MANIFEST_PATH.exists():
-        return {}
-    with MANIFEST_PATH.open(newline="", encoding="utf-8") as f:
-        return {row["doc_id"]: row for row in csv.DictReader(f)}
-
-
-def save_manifest(rows: dict[str, dict]) -> None:
-    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with MANIFEST_PATH.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-        writer.writeheader()
-        for doc_id in sorted(rows):
-            writer.writerow({k: rows[doc_id].get(k, "") for k in MANIFEST_FIELDS})
-
-
 # --- MedlinePlus -----------------------------------------------------------
 
 
@@ -207,13 +176,27 @@ def parse_mplus(xml_text: str) -> list[dict]:
         if local_name(el.tag) != "document":
             continue
         fields: dict[str, str] = {}
+        metadata: dict[str, str] = {}
         for child in el:
             if local_name(child.tag) != "content":
                 continue
             name = child.get("name", "")
             if name and name not in fields:
                 fields[name] = "".join(child.itertext())
-        docs.append({"url": el.get("url", ""), "fields": fields})
+            topic = next(
+                (item for item in child.iter() if local_name(item.tag) == "health-topic"),
+                None,
+            )
+            if topic is not None:
+                metadata = dict(topic.attrib)
+                fields["title"] = topic.get("title", "")
+                summary = next(
+                    (item for item in topic.iter() if local_name(item.tag) == "full-summary"),
+                    None,
+                )
+                if summary is not None:
+                    fields["FullSummary"] = "".join(summary.itertext())
+        docs.append({"url": el.get("url", ""), "fields": fields, "metadata": metadata})
     return docs
 
 
@@ -227,7 +210,8 @@ def download_medlineplus(manifest: dict[str, dict], retmax: int) -> int:
     for term in MPLUS_QUERIES:
         params = {"db": "healthTopics", "term": term, "retmax": retmax, "rettype": "topic"}
         resp = get(MPLUS_URL, params)
-        (query_dir / f"{slugify(term)}.xml").write_text(resp.text, encoding="utf-8")
+        query_path = query_dir / f"{slugify(term)}.xml"
+        query_path.write_text(resp.text, encoding="utf-8")
         docs = parse_mplus(resp.text)
         if not docs:
             print(f"  [warn] no documents parsed for '{term}' "
@@ -245,19 +229,23 @@ def download_medlineplus(manifest: dict[str, dict], retmax: int) -> int:
 
             doc_id = f"mplus-{slugify(title)}"
             path = out_dir / f"{doc_id}.txt"
-            path.write_text(f"{title}\n\n{body}\n", encoding="utf-8")
-            manifest[doc_id] = {
-                "doc_id": doc_id,
-                "source": "medlineplus",
-                "topic_area": term,
-                "title": title,
-                "url": url,
-                "source_version": "",
-                "retrieved_utc": now_utc(),
-                "license_note": MPLUS_LICENSE_NOTE,
-                "local_path": rel(path),
-                "sha256": sha256_of(path),
-            }
+            document = Document(
+                doc_id=doc_id,
+                source="medlineplus",
+                document_type="health_topic",
+                title=title,
+                section="full summary",
+                url=url,
+                retrieved_utc=now_utc(),
+                source_updated_at="",
+                source_version="",
+                content=f"{title}\n\n{body}\n",
+                metadata=doc.get("metadata", {}),
+            )
+            path.write_text(document.content, encoding="utf-8")
+            manifest[doc_id] = document_manifest_row(
+                document, term, MPLUS_LICENSE_NOTE, rel(path), rel(query_path)
+            )
             added += 1
             print(f"  + {title}")
         time.sleep(0.5)
@@ -311,26 +299,76 @@ def download_openfda(manifest: dict[str, dict]) -> int:
         json_path = out_dir / f"{doc_id}.json"
         txt_path = out_dir / f"{doc_id}.txt"
         json_path.write_text(json.dumps(label, indent=2), encoding="utf-8")
-        txt_path.write_text(render_label(label, generic), encoding="utf-8")
-
         manufacturer = ", ".join(label.get("openfda", {}).get("manufacturer_name", []))
-        manifest[doc_id] = {
-            "doc_id": doc_id,
-            "source": "openfda",
-            "topic_area": area,
-            "title": f"{generic} label ({manufacturer})" if manufacturer else f"{generic} label",
-            "url": f"https://dailymed.nlm.nih.gov/dailymed/lookup.cfm?setid={set_id}",
-            "source_version": f"effective_time={label.get('effective_time', '')};"
-                              f"version={label.get('version', '')}",
-            "retrieved_utc": now_utc(),
-            "license_note": OPENFDA_LICENSE_NOTE,
-            "local_path": rel(txt_path),
-            "sha256": sha256_of(txt_path),
-        }
+        document = Document(
+            doc_id=doc_id,
+            source="openfda",
+            document_type="drug_label",
+            title=f"{generic} label ({manufacturer})" if manufacturer else f"{generic} label",
+            section="prescribing information",
+            url=f"https://dailymed.nlm.nih.gov/dailymed/lookup.cfm?setid={set_id}",
+            retrieved_utc=now_utc(),
+            source_updated_at=label.get("effective_time", ""),
+            source_version=f"effective_time={label.get('effective_time', '')};"
+                           f"version={label.get('version', '')}",
+            content=render_label(label, generic),
+            metadata={"set_id": set_id, "generic_name": generic, "topic_area": area},
+        )
+        txt_path.write_text(document.content, encoding="utf-8")
+        manifest[doc_id] = document_manifest_row(
+            document, area, OPENFDA_LICENSE_NOTE, rel(txt_path), rel(json_path)
+        )
         added += 1
         print(f"  + {generic} ({manufacturer or 'unknown manufacturer'})")
         time.sleep(0.4)
     return added
+
+
+def complete_legacy_manifest(manifest: dict[str, dict]) -> None:
+    """Fill new provenance columns for previously downloaded records."""
+    medlineplus_raw_paths = {}
+    query_dir = RAW_DIR / "medlineplus" / "_queries"
+    if query_dir.exists():
+        for query_path in query_dir.glob("*.xml"):
+            for document in parse_mplus(query_path.read_text(encoding="utf-8")):
+                medlineplus_raw_paths.setdefault(document["url"], (query_path, document))
+
+    for row in manifest.values():
+        source = row.get("source", "")
+        local_path = ROOT / row.get("local_path", "")
+        if not row.get("document_type"):
+            row["document_type"] = {
+                "medlineplus": "health_topic",
+                "openfda": "drug_label",
+            }.get(source, "")
+        if not row.get("section"):
+            row["section"] = {
+                "medlineplus": "full summary",
+                "openfda": "prescribing information",
+            }.get(source, "")
+        if not row.get("content_hash"):
+            row["content_hash"] = row.get("sha256", "")
+        if row.get("raw_path"):
+            continue
+        if source == "openfda":
+            raw_path = local_path.with_suffix(".json")
+            if raw_path.exists():
+                row["raw_path"] = rel(raw_path)
+                try:
+                    label = json.loads(raw_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(f"Invalid existing openFDA JSON: {raw_path}") from error
+                if not row.get("source_updated_at"):
+                    row["source_updated_at"] = label.get("effective_time", "")
+                if not row.get("metadata_json"):
+                    row["metadata_json"] = json.dumps(
+                        {"set_id": label.get("set_id", "")}, sort_keys=True
+                    )
+        elif source == "medlineplus" and row.get("url") in medlineplus_raw_paths:
+            raw_path, document = medlineplus_raw_paths[row["url"]]
+            row["raw_path"] = rel(raw_path)
+            if not row.get("metadata_json"):
+                row["metadata_json"] = json.dumps(document.get("metadata", {}), sort_keys=True)
 
 
 # --- Entry point -----------------------------------------------------------
@@ -344,6 +382,7 @@ def main() -> int:
     args = parser.parse_args()
 
     manifest = load_manifest()
+    complete_legacy_manifest(manifest)
     total = 0
     if args.source in ("all", "medlineplus"):
         print("MedlinePlus health topics:")
