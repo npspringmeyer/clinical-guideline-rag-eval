@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.terminology.umls import UMLSClient, UMLSConfigurationError
+from src.ingestion.storage import atomic_write_text
 
 DEFAULT_OUTPUT = ROOT / "data" / "processed" / "umls" / "enrichment.jsonl"
 RAW_OUTPUT = ROOT / "data" / "raw" / "umls"
@@ -29,6 +31,11 @@ def main() -> int:
     )
     parser.add_argument("--release", default=os.getenv("UMLS_RELEASE", "current"))
     parser.add_argument("--max-candidates", type=int, default=10)
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass the 12-hour local UMLS response cache",
+    )
     parser.add_argument("--include-synonyms", action="store_true")
     parser.add_argument("--include-relationships", action="store_true")
     parser.add_argument("--expand", action="store_true", help="Also return optional query expansions")
@@ -41,31 +48,36 @@ def main() -> int:
     if args.max_candidates < 1:
         parser.error("--max-candidates must be at least one")
 
-    client = UMLSClient(release=args.release, raw_dir=RAW_OUTPUT)
+    client = UMLSClient(
+        release=args.release,
+        raw_dir=RAW_OUTPUT,
+        cache_ttl_seconds=0 if args.refresh else 12 * 60 * 60,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    written = set()
+    written: set[str] = set()
+    output = io.StringIO()
     try:
-        with args.output.open("w", encoding="utf-8") as output_file:
-            for query in dict.fromkeys(args.query):
-                method = client.expand_query if args.expand else client.normalize
-                result = method(
-                    query,
-                    max_candidates=args.max_candidates,
-                    include_synonyms=args.include_synonyms,
-                    include_relationships=args.include_relationships,
-                )
-                result["origin_doc_ids"] = args.document_id
-                key = f"{args.release}\0{query}\0{','.join(args.document_id)}"
-                result["enrichment_id"] = "umls-" + hashlib.sha256(
-                    key.encode("utf-8")
-                ).hexdigest()[:20]
-                hash_payload = {key: value for key, value in result.items()
-                                if key != "retrieved_utc"}
-                result["content_hash"] = hashlib.sha256(
-                    json.dumps(hash_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-                ).hexdigest()
-                output_file.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
-                written.add(query)
+        for query in dict.fromkeys(args.query):
+            method = client.expand_query if args.expand else client.normalize
+            result = method(
+                query,
+                max_candidates=args.max_candidates,
+                include_synonyms=args.include_synonyms,
+                include_relationships=args.include_relationships,
+            )
+            result["origin_doc_ids"] = args.document_id
+            key = f"{args.release}\0{query}\0{','.join(args.document_id)}"
+            result["enrichment_id"] = "umls-" + hashlib.sha256(
+                key.encode("utf-8")
+            ).hexdigest()[:20]
+            hash_payload = {key: value for key, value in result.items()
+                            if key != "retrieved_utc"}
+            result["content_hash"] = hashlib.sha256(
+                json.dumps(hash_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            output.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+            written.add(query)
+        atomic_write_text(args.output, output.getvalue())
     except UMLSConfigurationError as error:
         parser.error(str(error))
     print(f"Wrote UMLS raw API JSON responses to {RAW_OUTPUT}.")

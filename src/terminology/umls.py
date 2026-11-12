@@ -14,6 +14,8 @@ from urllib.parse import quote
 
 import requests
 
+from src.ingestion.storage import atomic_write_bytes
+
 API_ROOT = "https://uts-ws.nlm.nih.gov/rest"
 
 
@@ -33,16 +35,20 @@ class UMLSClient:
         retries: int = 3,
         sleep=time.sleep,
         raw_dir: Path | None = None,
+        cache_ttl_seconds: float = 12 * 60 * 60,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("UMLS_API_KEY")
         self.release = release or os.getenv("UMLS_RELEASE", "current")
-        if timeout <= 0 or retries < 1:
-            raise ValueError("timeout must be positive and retries must be at least one")
+        if timeout <= 0 or retries < 1 or cache_ttl_seconds < 0:
+            raise ValueError(
+                "timeout and retries must be positive and cache TTL cannot be negative"
+            )
         self.session = session or requests.Session()
         self.timeout = timeout
         self.retries = retries
         self.sleep = sleep
         self.raw_dir = raw_dir
+        self.cache_ttl_seconds = cache_ttl_seconds
 
     @property
     def available(self) -> bool:
@@ -54,6 +60,10 @@ class UMLSClient:
                 "UMLS is optional; set UMLS_API_KEY in the environment to enable access."
             )
         request_params = dict(params or {})
+        safe_params = request_params
+        cached = self._load_cached_response(path, safe_params)
+        if cached is not None:
+            return cached
         request_params["apiKey"] = self.api_key
         url = f"{API_ROOT}/{path.lstrip('/')}"
 
@@ -85,26 +95,58 @@ class UMLSClient:
                 payload = response.json()
             except ValueError as error:
                 raise RuntimeError("UMLS REST API returned invalid JSON") from error
+            if not isinstance(payload, dict):
+                raise RuntimeError("UMLS REST API returned an invalid response object")
             if self.raw_dir is not None:
                 self._save_raw_response(path, request_params, response.content)
             return payload
         raise RuntimeError("UMLS REST request failed without a response")
 
-    def _save_raw_response(
-        self, path: str, params: dict[str, Any], content: bytes
-    ) -> None:
-        """Store exact response bytes under a stable key without persisting credentials."""
+    def _request_cache_key(
+        self, path: str, params: dict[str, Any]
+    ) -> tuple[str, str]:
         safe_params = {key: value for key, value in params.items() if key != "apiKey"}
         request_fingerprint = hashlib.sha256(
             json.dumps([path, safe_params], sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:16]
-        response_fingerprint = hashlib.sha256(content).hexdigest()[:16]
         endpoint = re.sub(r"[^a-zA-Z0-9._-]+", "-", path).strip("-")
+        return endpoint, request_fingerprint
+
+    def _load_cached_response(
+        self, path: str, params: dict[str, Any]
+    ) -> dict | None:
+        if self.raw_dir is None or self.cache_ttl_seconds == 0:
+            return None
+        endpoint, request_fingerprint = self._request_cache_key(path, params)
+        pattern = f"{endpoint}-{request_fingerprint}-*.json"
+        candidates = sorted(
+            self.raw_dir.glob(pattern),
+            key=lambda candidate: candidate.stat().st_mtime,
+            reverse=True,
+        )
+        now = datetime.now().timestamp()
+        for candidate in candidates:
+            age = now - candidate.stat().st_mtime
+            if not 0 <= age <= self.cache_ttl_seconds:
+                continue
+            try:
+                payload = json.loads(candidate.read_bytes())
+            except (OSError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    def _save_raw_response(
+        self, path: str, params: dict[str, Any], content: bytes
+    ) -> None:
+        """Store exact response bytes under a stable key without persisting credentials."""
+        endpoint, request_fingerprint = self._request_cache_key(path, params)
+        response_fingerprint = hashlib.sha256(content).hexdigest()[:16]
         output_path = self.raw_dir / (
             f"{endpoint}-{request_fingerprint}-{response_fingerprint}.json"
         )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(content)
+        atomic_write_bytes(output_path, content)
 
     def search(self, term: str, max_results: int = 10) -> list[dict]:
         if not term.strip():

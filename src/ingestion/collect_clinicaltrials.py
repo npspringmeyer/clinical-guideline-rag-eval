@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.ingestion.clinicaltrials import ClinicalTrialsClient, study_to_document
 from src.ingestion.manifest import document_manifest_row, load_manifest, save_manifest
+from src.ingestion.storage import atomic_write_bytes, atomic_write_text
 
 LOGGER = logging.getLogger(__name__)
 LICENSE_NOTE = "ClinicalTrials.gov API data; review source terms before redistribution."
@@ -55,16 +56,16 @@ def collect_studies(
             raw_path = raw_dir / (
                 f"{_slug(label)}-page-{page_count:04d}-{page_hash}.json"
             )
-            raw_path.write_bytes(page.raw_content)
+            atomic_write_bytes(raw_path, page.raw_content)
             for study in page.payload.get("studies", []):
-                document = study_to_document(study)
+                document = study_to_document(study, page.retrieved_utc)
                 if document.doc_id in seen_ids:
                     continue
                 seen_ids.add(document.doc_id)
                 processed_path = processed_dir / f"{document.doc_id}.json"
-                processed_path.write_text(
+                atomic_write_text(
+                    processed_path,
                     json.dumps(document.to_dict(), ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
                 )
                 manifest[document.doc_id] = document_manifest_row(
                     document,

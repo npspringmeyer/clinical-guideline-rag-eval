@@ -140,6 +140,46 @@ class UMLSTests(unittest.TestCase):
             self.assertEqual(saved_files[0].read_bytes(), response_body)
             self.assertNotIn(b"do-not-save-this-key", saved_files[0].read_bytes())
 
+    def test_reuses_recent_cached_response_without_another_request(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({"result": {"results": [
+            {"ui": "D011225", "name": "Pre-Eclampsia"},
+        ]}})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = UMLSClient(
+                api_key="test-key", session=session, raw_dir=Path(temp_dir)
+            )
+
+            first = client.search("preeclampsia")
+            second = client.search("preeclampsia")
+
+            self.assertEqual(first, second)
+            session.get.assert_called_once()
+
+    def test_corrupted_cache_is_refetched_and_replaced_with_valid_response(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({"result": {"results": [
+            {"ui": "6809", "name": "metformin"},
+        ]}})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_dir = Path(temp_dir)
+            client = UMLSClient(
+                api_key="test-key", session=session, raw_dir=raw_dir
+            )
+            client.search_source("metformin", "RXNORM")
+            cache_path = next(raw_dir.glob("*.json"))
+            cache_path.write_text("{corrupt", encoding="utf-8")
+
+            results = client.search_source("metformin", "RXNORM")
+
+            self.assertEqual(results[0]["ui"], "6809")
+            self.assertEqual(session.get.call_count, 2)
+            self.assertNotIn("test-key", cache_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                client.search_source("metformin", "RXNORM")[0]["ui"], "6809"
+            )
+            self.assertEqual(session.get.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

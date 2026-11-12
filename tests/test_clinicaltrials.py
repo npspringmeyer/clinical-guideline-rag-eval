@@ -116,6 +116,8 @@ class ClinicalTrialsTests(unittest.TestCase):
             self.assertEqual(
                 mplus_doc["metadata"]["capture_timestamp_basis"], "local_query_file_mtime"
             )
+            self.assertEqual(mplus_doc["source_version_status"], "not_provided")
+            self.assertEqual(mplus_doc["source_updated_at_status"], "not_provided")
             self.assertEqual(fda_row["content_hash"], fda_doc["content_hash"])
             self.assertEqual(mplus_row["content_hash"], mplus_doc["content_hash"])
 
@@ -123,6 +125,46 @@ class ClinicalTrialsTests(unittest.TestCase):
             self.assertEqual(set(manifest), first_ids)
             self.assertEqual(json.loads(mplus_doc_path.read_text())["content_hash"],
                              mplus_doc["content_hash"])
+
+    def test_legacy_trial_manifest_statuses_are_migrated_from_raw_record(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_path = root / "data/raw/clinicaltrials/page.json"
+            processed_path = root / "data/processed/clinicaltrials/ctg-NCT01234567.json"
+            raw_path.parent.mkdir(parents=True)
+            processed_path.parent.mkdir(parents=True)
+            study = sample_study()
+            raw_path.write_text(json.dumps({"studies": [study]}), encoding="utf-8")
+            old_document = study_to_document(study).to_dict()
+            old_document.pop("source_version_status")
+            old_document.pop("source_updated_at_status")
+            processed_path.write_text(json.dumps(old_document), encoding="utf-8")
+            manifest = {
+                "ctg-NCT01234567": {
+                    "doc_id": "ctg-NCT01234567",
+                    "source": "clinicaltrials.gov",
+                    "title": "Study of a treatment",
+                    "url": "https://clinicaltrials.gov/study/NCT01234567",
+                    "local_path": "data/processed/clinicaltrials/ctg-NCT01234567.json",
+                    "raw_path": "data/raw/clinicaltrials/page.json",
+                    "retrieved_utc": "2025-04-04T00:00:00+00:00",
+                    "source_version": "",
+                    "source_updated_at": "2025-04-03",
+                    "source_version_status": "legacy_unknown",
+                    "source_updated_at_status": "available",
+                    "metadata_json": json.dumps({"nct_id": "NCT01234567"}),
+                }
+            }
+
+            migrate_legacy_outputs(manifest, root)
+
+            row = manifest["ctg-NCT01234567"]
+            document = json.loads(processed_path.read_text(encoding="utf-8"))
+            self.assertEqual(row["source_version_status"], "not_provided")
+            self.assertEqual(row["source_updated_at_status"], "available")
+            self.assertEqual(document["source_version_status"], "not_provided")
+            self.assertEqual(document["source_updated_at_status"], "available")
+            self.assertEqual(document["retrieved_utc"], old_document["retrieved_utc"])
 
     def test_builds_condition_intervention_and_generic_parameter_searches(self):
         searches = build_searches(
@@ -160,6 +202,23 @@ class ClinicalTrialsTests(unittest.TestCase):
         self.assertEqual(session.get.call_args_list[0].kwargs["params"]["pageSize"], 1)
         self.assertEqual(session.get.call_args_list[1].kwargs["params"]["pageToken"], "token-2")
 
+    def test_fetch_page_reuses_cached_response_and_capture_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = Mock()
+            session.get.return_value = FakeResponse(
+                {"studies": []}, raw_content=b'{"studies":[]}'
+            )
+            client = ClinicalTrialsClient(
+                session=session, cache_dir=Path(temp_dir), sleep=Mock()
+            )
+
+            first = client.fetch_page({"query.cond": "preeclampsia"}, 1)
+            second = client.fetch_page({"query.cond": "preeclampsia"}, 1)
+
+            session.get.assert_called_once()
+            self.assertEqual(first.raw_content, second.raw_content)
+            self.assertEqual(first.retrieved_utc, second.retrieved_utc)
+
     def test_retries_rate_limit_and_honors_retry_after(self):
         sleep = Mock()
         session = Mock()
@@ -186,11 +245,31 @@ class ClinicalTrialsTests(unittest.TestCase):
         document = study_to_document(sample_study(), "2025-04-04T00:00:00+00:00")
         self.assertEqual(document.doc_id, "ctg-NCT01234567")
         self.assertEqual(document.source_updated_at, "2025-04-03")
+        self.assertEqual(document.source_updated_at_status, "available")
+        self.assertEqual(document.source_version, "")
+        self.assertEqual(document.source_version_status, "not_provided")
         self.assertEqual(document.metadata["nct_id"], "NCT01234567")
         self.assertTrue(document.metadata["not_clinical_evidence"])
         self.assertIn("Eligibility criteria", document.content)
         self.assertIn("Reported results data", document.content)
         self.assertEqual(len(document.content_hash), 64)
+
+    def test_study_version_and_update_date_statuses_are_explicit(self):
+        study = sample_study()
+        study["studyVersion"] = "2"
+        study["protocolSection"]["statusModule"] = {}
+
+        document = study_to_document(study)
+
+        self.assertEqual(document.source_version, "2")
+        self.assertEqual(document.source_version_status, "available")
+        self.assertEqual(document.source_updated_at, "")
+        self.assertEqual(document.source_updated_at_status, "not_provided")
+
+        study["studyVersion"] = {"unexpected": "shape"}
+        failed_extraction = study_to_document(study)
+        self.assertEqual(failed_extraction.source_version, "")
+        self.assertEqual(failed_extraction.source_version_status, "extraction_failed")
 
     def test_collection_preserves_raw_pages_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,6 +311,40 @@ class ClinicalTrialsTests(unittest.TestCase):
             self.assertEqual(normalized["doc_id"], "ctg-NCT01234567")
             self.assertEqual(manifest["ctg-NCT01234567"]["document_type"],
                              "clinical_trial_registration")
+
+    def test_collection_reuses_cached_page_without_changing_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = Mock(get=Mock(return_value=FakeResponse(
+                {"studies": [sample_study()]},
+                raw_content=json.dumps({"studies": [sample_study()]}).encode(),
+            )))
+            client = ClinicalTrialsClient(
+                session=session, cache_dir=root / "cache", sleep=Mock()
+            )
+            kwargs = {
+                "raw_dir": root / "raw",
+                "processed_dir": root / "processed",
+                "manifest_path": root / "manifest.csv",
+            }
+
+            collect_studies(
+                client,
+                [("hypertension", {"query.cond": "hypertension"})],
+                **kwargs,
+            )
+            doc_path = root / "processed" / "ctg-NCT01234567.json"
+            first_document = doc_path.read_bytes()
+            first_manifest = (root / "manifest.csv").read_bytes()
+            collect_studies(
+                client,
+                [("hypertension", {"query.cond": "hypertension"})],
+                **kwargs,
+            )
+
+            session.get.assert_called_once()
+            self.assertEqual(doc_path.read_bytes(), first_document)
+            self.assertEqual((root / "manifest.csv").read_bytes(), first_manifest)
 
 
 if __name__ == "__main__":

@@ -10,13 +10,18 @@ from scripts import download_data
 
 class DownloadDataTests(unittest.TestCase):
     def test_get_retries_rate_limit_and_honors_retry_after(self):
-        limited = Mock(status_code=429, headers={"Retry-After": "2"})
-        limited.raise_for_status.side_effect = requests.HTTPError("rate limited")
-        success = Mock(status_code=200)
+        limited = requests.Response()
+        limited.status_code = 429
+        limited.headers["Retry-After"] = "2"
+        success = requests.Response()
+        success.status_code = 200
+        success._content = b"ok"
 
         with (
             patch.object(download_data.requests, "get", side_effect=[limited, success]) as get,
             patch.object(download_data.time, "sleep") as sleep,
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(download_data, "RAW_DIR", Path(temp_dir)),
         ):
             response = download_data.get("https://example.test/data", {}, retries=2)
 
@@ -24,18 +29,36 @@ class DownloadDataTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         sleep.assert_called_once_with(2.0)
 
+    def test_get_reuses_cached_response_and_refresh_bypasses_cache(self):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"snapshot"
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(download_data, "RAW_DIR", Path(temp_dir)),
+            patch.object(download_data.requests, "get", return_value=response) as get,
+        ):
+            first = download_data.get("https://example.test/data", {"q": "x"})
+            second = download_data.get("https://example.test/data", {"q": "x"})
+            self.assertEqual(get.call_count, 1)
+
+            download_data.get("https://example.test/data", {"q": "x"}, refresh=True)
+
+        self.assertEqual(first.content, second.content)
+        self.assertEqual(get.call_count, 2)
+
     def test_get_returns_openfda_not_found_without_retry(self):
-        not_found = Mock(status_code=404)
+        not_found = requests.Response()
+        not_found.status_code = 404
         with patch.object(download_data.requests, "get", return_value=not_found) as get:
             response = download_data.get(download_data.OPENFDA_URL, {}, retries=2)
 
         self.assertIs(response, not_found)
         get.assert_called_once()
-        not_found.raise_for_status.assert_not_called()
 
     def test_get_does_not_retry_permanent_http_error(self):
-        bad_request = Mock(status_code=400)
-        bad_request.raise_for_status.side_effect = requests.HTTPError("bad request")
+        bad_request = requests.Response()
+        bad_request.status_code = 400
         with (
             patch.object(download_data.requests, "get", return_value=bad_request) as get,
             patch.object(download_data.time, "sleep") as sleep,
@@ -113,6 +136,12 @@ class DownloadDataTests(unittest.TestCase):
                 next(snapshot.name for snapshot in snapshots
                      if "updated summary" in snapshot.read_text()),
             )
+            self.assertEqual(
+                manifest["mplus-edema"]["source_version_status"], "not_provided"
+            )
+            self.assertEqual(
+                manifest["mplus-edema"]["source_updated_at_status"], "not_provided"
+            )
 
     def test_openfda_keeps_versioned_raw_records_outside_processed_documents(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -168,6 +197,8 @@ class DownloadDataTests(unittest.TestCase):
                 json.loads((root / row["local_path"]).read_text())["source_updated_at"],
                 "20260101",
             )
+            self.assertEqual(row["source_version_status"], "available")
+            self.assertEqual(row["source_updated_at_status"], "available")
             self.assertTrue((root / row["raw_path"]).is_file())
 
 

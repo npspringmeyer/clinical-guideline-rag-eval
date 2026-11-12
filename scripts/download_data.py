@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import html
 import json
+import logging
 import os
 import re
 import sys
@@ -44,6 +45,9 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.ingestion.manifest import document_manifest_row, load_manifest, save_manifest
+from src.ingestion.http_cache import CACHE_TIMESTAMP_HEADER, request_with_cache
+from src.ingestion.storage import atomic_write_bytes, atomic_write_text
+from src.ingestion.clinicaltrials import study_to_document
 from src.models.document import Document
 
 RAW_DIR = ROOT / "data" / "raw"
@@ -61,6 +65,7 @@ OPENFDA_LICENSE_NOTE = (
     "openFDA data; see openFDA terms of service. "
     "Not for medical care decisions."
 )
+LOGGER = logging.getLogger(__name__)
 
 # --- Corpus definition: edit these lists to change scope -------------------
 
@@ -125,6 +130,11 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def response_retrieved_utc(response: requests.Response) -> str:
+    value = response.headers.get(CACHE_TIMESTAMP_HEADER)
+    return value if isinstance(value, str) and value else now_utc()
+
+
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
 
@@ -135,18 +145,27 @@ def rel(path: Path) -> str:
 
 def save_processed_document(document: Document, root: Path = ROOT) -> Path:
     path = root / "data" / "processed" / document.source / f"{document.doc_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(document.to_dict(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    atomic_write_text(
+        path, json.dumps(document.to_dict(), ensure_ascii=False, indent=2) + "\n"
     )
     return path
 
 
-def get(url: str, params: dict, retries: int = 3) -> requests.Response:
+def get(
+    url: str, params: dict, retries: int = 3, refresh: bool = False
+) -> requests.Response:
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            resp = request_with_cache(
+                lambda: requests.get(
+                    url, params=params, headers=HEADERS, timeout=30
+                ),
+                method="GET",
+                url=url,
+                params=params,
+                cache_dir=RAW_DIR / ".http-cache",
+                refresh=refresh,
+            )
         except requests.RequestException as error:
             if attempt == retries:
                 raise RuntimeError(
@@ -226,7 +245,9 @@ def parse_mplus(xml_text: str) -> list[dict]:
     return docs
 
 
-def download_medlineplus(manifest: dict[str, dict], retmax: int) -> int:
+def download_medlineplus(
+    manifest: dict[str, dict], retmax: int, refresh: bool = False
+) -> int:
     out_dir = RAW_DIR / "medlineplus"
     query_dir = out_dir / "_queries"
     query_dir.mkdir(parents=True, exist_ok=True)
@@ -235,11 +256,11 @@ def download_medlineplus(manifest: dict[str, dict], retmax: int) -> int:
 
     for term in MPLUS_QUERIES:
         params = {"db": "healthTopics", "term": term, "retmax": retmax, "rettype": "topic"}
-        resp = get(MPLUS_URL, params)
+        resp = get(MPLUS_URL, params, refresh=refresh)
         raw_content = resp.content
         query_hash = hashlib.sha256(raw_content).hexdigest()[:16]
         query_path = query_dir / f"{slugify(term)}-{query_hash}.xml"
-        query_path.write_bytes(raw_content)
+        atomic_write_bytes(query_path, raw_content)
         docs = parse_mplus(resp.text)
         if not docs:
             print(f"  [warn] no documents parsed for '{term}' "
@@ -263,11 +284,13 @@ def download_medlineplus(manifest: dict[str, dict], retmax: int) -> int:
                 title=title,
                 section="full summary",
                 url=url,
-                retrieved_utc=now_utc(),
+                retrieved_utc=response_retrieved_utc(resp),
                 source_updated_at="",
                 source_version="",
                 content=f"{title}\n\n{body}\n",
                 metadata=doc.get("metadata", {}),
+                source_version_status="not_provided",
+                source_updated_at_status="not_provided",
             )
             processed_path = save_processed_document(document)
             manifest[doc_id] = document_manifest_row(
@@ -307,7 +330,7 @@ def render_label(label: dict, generic: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def download_openfda(manifest: dict[str, dict]) -> int:
+def download_openfda(manifest: dict[str, dict], refresh: bool = False) -> int:
     out_dir = RAW_DIR / "openfda"
     out_dir.mkdir(parents=True, exist_ok=True)
     api_key = os.environ.get("OPENFDA_API_KEY")
@@ -317,7 +340,7 @@ def download_openfda(manifest: dict[str, dict]) -> int:
         params = {"search": f'openfda.generic_name:"{generic}"', "limit": 25}
         if api_key:
             params["api_key"] = api_key
-        resp = get(OPENFDA_URL, params)
+        resp = get(OPENFDA_URL, params, refresh=refresh)
         results = resp.json().get("results", []) if resp.status_code == 200 else []
         if not results:
             print(f"  [warn] no label found for {generic}")
@@ -330,8 +353,32 @@ def download_openfda(manifest: dict[str, dict]) -> int:
         raw_content = (json.dumps(label, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         raw_hash = hashlib.sha256(raw_content).hexdigest()[:16]
         json_path = out_dir / f"{doc_id}-{raw_hash}.json"
-        json_path.write_bytes(raw_content)
+        atomic_write_bytes(json_path, raw_content)
         manufacturer = ", ".join(label.get("openfda", {}).get("manufacturer_name", []))
+        effective_time = label.get("effective_time")
+        label_version = label.get("version")
+        source_version_parts = []
+        version_extraction_failed = False
+        for field_name, field_value in (
+            ("effective_time", effective_time),
+            ("version", label_version),
+        ):
+            if isinstance(field_value, (str, int)) and str(field_value).strip():
+                source_version_parts.append(f"{field_name}={field_value}")
+            elif field_value not in (None, ""):
+                version_extraction_failed = True
+        source_updated_at = (
+            str(effective_time)
+            if isinstance(effective_time, (str, int)) and str(effective_time).strip()
+            else ""
+        )
+        updated_status = (
+            "available"
+            if source_updated_at
+            else "extraction_failed"
+            if effective_time not in (None, "")
+            else "not_provided"
+        )
         document = Document(
             doc_id=doc_id,
             source="openfda",
@@ -339,12 +386,19 @@ def download_openfda(manifest: dict[str, dict]) -> int:
             title=f"{generic} label ({manufacturer})" if manufacturer else f"{generic} label",
             section="prescribing information",
             url=f"https://dailymed.nlm.nih.gov/dailymed/lookup.cfm?setid={set_id}",
-            retrieved_utc=now_utc(),
-            source_updated_at=label.get("effective_time", ""),
-            source_version=f"effective_time={label.get('effective_time', '')};"
-                           f"version={label.get('version', '')}",
+            retrieved_utc=response_retrieved_utc(resp),
+            source_updated_at=source_updated_at,
+            source_version=";".join(source_version_parts),
             content=render_label(label, generic),
             metadata={"set_id": set_id, "generic_name": generic, "topic_area": area},
+            source_version_status=(
+                "extraction_failed"
+                if version_extraction_failed
+                else "available"
+                if source_version_parts
+                else "not_provided"
+            ),
+            source_updated_at_status=updated_status,
         )
         processed_path = save_processed_document(document)
         manifest[doc_id] = document_manifest_row(
@@ -388,6 +442,41 @@ def _migrate_openfda_records(manifest: dict[str, dict], root: Path) -> None:
         metadata.setdefault("set_id", label.get("set_id", ""))
         metadata.setdefault("generic_name", generic)
         metadata.setdefault("topic_area", row.get("topic_area", ""))
+        raw_effective_time = label.get("effective_time")
+        raw_label_version = label.get("version")
+        extracted_version_parts = []
+        version_extraction_failed = False
+        for field_name, field_value in (
+            ("effective_time", raw_effective_time),
+            ("version", raw_label_version),
+        ):
+            if isinstance(field_value, (str, int)) and str(field_value).strip():
+                extracted_version_parts.append(f"{field_name}={field_value}")
+            elif field_value not in (None, ""):
+                version_extraction_failed = True
+        version_value = row.get("source_version") or ";".join(extracted_version_parts)
+        updated_value = row.get("source_updated_at") or (
+            str(raw_effective_time)
+            if isinstance(raw_effective_time, (str, int))
+            and str(raw_effective_time).strip()
+            else ""
+        )
+        version_status = row.get("source_version_status", "")
+        if version_status == "extraction_failed" or version_extraction_failed:
+            version_status = "extraction_failed"
+        elif version_value:
+            version_status = "available"
+        elif version_status in ("", "legacy_unknown"):
+            version_status = "not_provided"
+        updated_status = row.get("source_updated_at_status", "")
+        if updated_value:
+            updated_status = "available"
+        elif updated_status in ("", "legacy_unknown"):
+            updated_status = (
+                "extraction_failed"
+                if raw_effective_time not in (None, "")
+                else "not_provided"
+            )
         document = Document(
             doc_id=row["doc_id"],
             source="openfda",
@@ -396,10 +485,12 @@ def _migrate_openfda_records(manifest: dict[str, dict], root: Path) -> None:
             section=row.get("section") or "prescribing information",
             url=row["url"],
             retrieved_utc=row.get("retrieved_utc") or now_utc(),
-            source_updated_at=row.get("source_updated_at") or label.get("effective_time", ""),
-            source_version=row.get("source_version", ""),
+            source_updated_at=updated_value,
+            source_version=version_value,
             content=content,
             metadata=metadata or {"set_id": label.get("set_id", "")},
+            source_version_status=version_status,
+            source_updated_at_status=updated_status,
         )
         processed_path = save_processed_document(document, root)
         manifest[row["doc_id"]] = document_manifest_row(
@@ -459,6 +550,8 @@ def _migrate_medlineplus_records(manifest: dict[str, dict], root: Path) -> None:
                 source_version="",
                 content=f"{title}\n\n{body}\n",
                 metadata=metadata,
+                source_version_status="not_provided",
+                source_updated_at_status="not_provided",
             )
             processed_path = save_processed_document(document, root)
             manifest[doc_id] = document_manifest_row(
@@ -470,10 +563,94 @@ def _migrate_medlineplus_records(manifest: dict[str, dict], root: Path) -> None:
             )
 
 
+def _migrate_legacy_source_metadata_statuses(
+    manifest: dict[str, dict], root: Path
+) -> None:
+    trial_payloads: dict[Path, dict] = {}
+    for row in manifest.values():
+        source = row.get("source")
+        version_status = row.get("source_version_status", "legacy_unknown")
+        updated_status = row.get("source_updated_at_status", "legacy_unknown")
+        if source == "medlineplus":
+            if not row.get("source_version") and version_status == "legacy_unknown":
+                row["source_version_status"] = "not_provided"
+            if not row.get("source_updated_at") and updated_status == "legacy_unknown":
+                row["source_updated_at_status"] = "not_provided"
+        elif source == "clinicaltrials.gov" and (
+            version_status == "legacy_unknown" or updated_status == "legacy_unknown"
+        ):
+            raw_path = root / row.get("raw_path", "")
+            if not raw_path.is_file():
+                continue
+            if raw_path not in trial_payloads:
+                try:
+                    trial_payloads[raw_path] = json.loads(
+                        raw_path.read_text(encoding="utf-8")
+                    )
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        f"Invalid ClinicalTrials.gov raw JSON: {raw_path}"
+                    ) from error
+            payload = trial_payloads[raw_path]
+            metadata = json.loads(row.get("metadata_json") or "{}")
+            nct_id = metadata.get("nct_id") or row["doc_id"].removeprefix("ctg-")
+            study = next(
+                (
+                    item
+                    for item in payload.get("studies", [])
+                    if item.get("protocolSection", {})
+                    .get("identificationModule", {})
+                    .get("nctId")
+                    == nct_id
+                ),
+                None,
+            )
+            if study is None:
+                LOGGER.warning(
+                    "Could not match %s to its raw ClinicalTrials.gov response",
+                    row["doc_id"],
+                )
+                continue
+            extracted = study_to_document(study, row.get("retrieved_utc"))
+            if version_status == "legacy_unknown":
+                row["source_version"] = extracted.source_version
+                row["source_version_status"] = extracted.source_version_status
+            if updated_status == "legacy_unknown":
+                row["source_updated_at"] = extracted.source_updated_at
+                row["source_updated_at_status"] = extracted.source_updated_at_status
+                metadata["source_update_date"] = extracted.source_updated_at
+                row["metadata_json"] = json.dumps(metadata, sort_keys=True)
+
+        if source in {"medlineplus", "clinicaltrials.gov"}:
+            local_path = root / row.get("local_path", "")
+            if not local_path.is_file():
+                continue
+            try:
+                document = json.loads(local_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"Invalid processed document JSON: {local_path}"
+                ) from error
+            document["source_version"] = row.get("source_version", "")
+            document["source_version_status"] = row.get(
+                "source_version_status", "legacy_unknown"
+            )
+            document["source_updated_at"] = row.get("source_updated_at", "")
+            document["source_updated_at_status"] = row.get(
+                "source_updated_at_status", "legacy_unknown"
+            )
+            document["metadata"] = json.loads(row.get("metadata_json") or "{}")
+            atomic_write_text(
+                local_path,
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            )
+
+
 def migrate_legacy_outputs(manifest: dict[str, dict], root: Path = ROOT) -> None:
     """Move legacy normalized files out of raw storage and index cached topics."""
     _migrate_openfda_records(manifest, root)
     _migrate_medlineplus_records(manifest, root)
+    _migrate_legacy_source_metadata_statuses(manifest, root)
 
 
 # --- Entry point -----------------------------------------------------------
@@ -484,6 +661,11 @@ def main() -> int:
     parser.add_argument("--source", choices=["all", "medlineplus", "openfda"], default="all")
     parser.add_argument("--retmax", type=int, default=3,
                         help="MedlinePlus results to keep per search term")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass the 12-hour local HTTP response cache",
+    )
     args = parser.parse_args()
 
     manifest = load_manifest()
@@ -491,10 +673,10 @@ def main() -> int:
     total = 0
     if args.source in ("all", "medlineplus"):
         print("MedlinePlus health topics:")
-        total += download_medlineplus(manifest, args.retmax)
+        total += download_medlineplus(manifest, args.retmax, refresh=args.refresh)
     if args.source in ("all", "openfda"):
         print("openFDA drug labels:")
-        total += download_openfda(manifest)
+        total += download_openfda(manifest, refresh=args.refresh)
 
     save_manifest(manifest)
     print(f"\nDone. {total} documents added or refreshed; "

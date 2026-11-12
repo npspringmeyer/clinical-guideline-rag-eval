@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT))
 from src.ingestion.clinicaltrials import ClinicalTrialsClient, DEFAULT_CONDITIONS
 from src.ingestion.collect_clinicaltrials import build_searches, collect_studies
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def _key_value(value: str) -> tuple[str, str]:
     key, separator, content = value.partition("=")
@@ -39,6 +41,11 @@ def main() -> int:
     parser.add_argument("--page-size", type=int, default=100, help="API page size (1-1000)")
     parser.add_argument("--timeout", type=float, default=30, help="Request timeout in seconds")
     parser.add_argument("--retries", type=int, default=3, help="Maximum attempts per page")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass the 12-hour local HTTP response cache",
+    )
     args = parser.parse_args()
     if args.limit < 0:
         parser.error("--limit cannot be negative")
@@ -58,7 +65,12 @@ def main() -> int:
         )
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
         count = collect_studies(
-            ClinicalTrialsClient(timeout=args.timeout, retries=args.retries),
+            ClinicalTrialsClient(
+                timeout=args.timeout,
+                retries=args.retries,
+                cache_dir=ROOT / "data" / "raw" / "clinicaltrials" / ".http-cache",
+                refresh=args.refresh,
+            ),
             searches,
             args.limit,
             args.page_size,

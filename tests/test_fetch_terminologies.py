@@ -26,6 +26,18 @@ class FetchTerminologiesTests(unittest.TestCase):
                     ["fetch_terminologies.py", "--output", str(output)],
                 ),
                 patch.object(fetch_terminologies, "UMLSClient") as client_factory,
+                patch.object(fetch_terminologies, "load_manifest", return_value={
+                    "mplus-preeclampsia": {
+                        "doc_id": "mplus-preeclampsia",
+                        "source": "medlineplus",
+                        "topic_area": "preeclampsia",
+                    },
+                    "fda-labetalol-12345678": {
+                        "doc_id": "fda-labetalol-12345678",
+                        "source": "openfda",
+                        "metadata_json": json.dumps({"generic_name": "labetalol"}),
+                    },
+                }),
             ):
                 client = client_factory.return_value
                 client.search_source.side_effect = [
@@ -51,8 +63,35 @@ class FetchTerminologiesTests(unittest.TestCase):
                 [record["candidates"][0]["rootSource"] for record in records],
                 ["MSH", "RXNORM"],
             )
+            self.assertEqual(
+                [record["origin_doc_ids"] for record in records],
+                [["mplus-preeclampsia"], ["fda-labetalol-12345678"]],
+            )
             self.assertTrue(all(record["content_hash"] for record in records))
             self.assertNotIn("test-key", output.read_text(encoding="utf-8"))
+
+    def test_failed_fetch_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "terms.jsonl"
+            output.write_text("previous valid data\n", encoding="utf-8")
+            with (
+                patch.dict(os.environ, {"UMLS_API_KEY": "test-key"}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["fetch_terminologies.py", "--output", str(output)],
+                ),
+                patch.object(fetch_terminologies, "UMLSClient") as client_factory,
+            ):
+                client_factory.return_value.search_source.side_effect = RuntimeError(
+                    "service unavailable"
+                )
+                with self.assertRaisesRegex(RuntimeError, "service unavailable"):
+                    fetch_terminologies.main()
+
+            self.assertEqual(
+                output.read_text(encoding="utf-8"), "previous valid data\n"
+            )
 
 
 if __name__ == "__main__":
