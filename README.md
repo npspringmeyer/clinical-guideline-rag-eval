@@ -26,8 +26,10 @@ python scripts/collect_clinicaltrials.py \
 `--condition`, `--intervention`, and `--query-term` are repeatable. Additional
 supported API v2 parameters can be passed as `--query-param KEY=VALUE`.
 Pagination follows the API's `nextPageToken`; requests have timeouts, bounded
-retries, and rate-limit handling. Raw API response snapshots use content-derived
-filenames and are retained under
+retries, rate-limit handling, and a 12-hour local response cache. Use
+`--refresh` to bypass the cache. Retrieval timestamps preserve the original
+response capture time when a cached response is reused. Raw API response
+snapshots use content-derived filenames and are retained under
 `data/raw/clinicaltrials/`, and normalized documents using the shared schema
 are written under `data/processed/clinicaltrials/`.
 
@@ -51,7 +53,8 @@ This searches the configured MedlinePlus query terms in MeSH (`MSH`) and the
 openFDA generic drug names in RxNorm (`RXNORM`). Use `--source MSH` or
 `--source RXNORM` to fetch one vocabulary, `--max-results` to set the per-term
 result limit, or `--search-type words` for broader matches (the default is
-exact matching). MeSH identifiers can support topic tagging and later
+exact matching). These requests use a 12-hour local cache; pass `--refresh`
+to bypass it. MeSH identifiers can support topic tagging and later
 literature searches; this command does not download literature. RxNorm
 identifiers and names provide medication terminology matches, without
 automatically selecting among ambiguous candidates. Exact API responses are
@@ -71,21 +74,34 @@ is opt-in and never replaces the original query or resolves ambiguity by
 selecting a single candidate.
 UMLS terminology is metadata, not clinical evidence. Access, storage, and
 redistribution of UMLS data and derivatives are subject to the UMLS license
-and the licenses of the source vocabularies available to the account. Raw and
-processed outputs are git-ignored; review rights before sharing either.
+and the licenses of the source vocabularies available to the account. The
+UMLS license restricts redistribution of the Metathesaurus and source-vocabulary
+subsets; do not commit downloaded UMLS, MeSH, or RxNorm response/enrichment
+content to this public repository without confirming permissions for every
+included vocabulary. Raw and processed outputs are git-ignored; review rights
+before sharing either.
 
 ## Document and provenance layout
 
 `src/models/document.py` defines the common normalized document fields:
 stable `doc_id`, source, document type, title, section, source URL, retrieval
 timestamp, source update date, source version, content, metadata, and a
-SHA-256 content hash. All evidence-source normalized documents use this schema
-as JSON under `data/processed/<source>/`; `data/raw/` holds source responses
+SHA-256 content hash. The additive `source_version_status` and
+`source_updated_at_status` fields distinguish `available`, `not_provided`,
+`extraction_failed`, and `legacy_unknown`; blank historical values remain blank
+instead of being replaced with invented versions. Retrieval time is separate
+from the source's update date. All evidence-source normalized documents use
+this schema as JSON under `data/processed/<source>/`; `data/raw/` holds source responses
 (MedlinePlus XML, openFDA label JSON, and API responses). `data/manifest.csv`
 keeps its original columns and adds
 the standardized type, section, update date, raw path, content hash, and
 source-specific metadata columns. The legacy `sha256` column remains for
-compatibility. The downloader migrates existing openFDA text files and the
+compatibility. New manifest columns are appended to preserve existing column
+positions. Manifest and document writes use same-directory atomic replace;
+local HTTP/UMLS cache files are also written atomically. Cache keys exclude
+credential parameters, and cached UMLS raw responses never contain the API key.
+Use `--refresh` on collection/enrichment commands to bypass the 12-hour cache.
+The downloader migrates existing openFDA text files and the
 cached MedlinePlus query XML into the processed schema and manifest without
 refetching those records. New MedlinePlus query snapshots and openFDA label
 records also use content-derived filenames so later downloads do not overwrite
@@ -100,6 +116,11 @@ identified as registry information, not published evidence or proof of
 treatment effectiveness. UMLS results are stored separately and must not be
 treated as evidence documents. These public-source integrations can
 therefore be inspected and validated before any embedding or indexing work.
+Terminology enrichment remains separate from evidence documents: each JSONL
+record has a stable `enrichment_id`, `origin_doc_ids`, original query,
+source-vocabulary candidates, release, retrieval timestamp, and content hash.
+Use `origin_doc_ids` to link a terminology result to its source documents;
+UMLS CUIs and MeSH/RxNorm codes remain distinct identifiers.
 
 ## Tests
 
