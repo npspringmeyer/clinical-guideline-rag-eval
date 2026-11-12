@@ -1,4 +1,5 @@
 import json
+import requests
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,56 @@ from scripts import download_data
 
 
 class DownloadDataTests(unittest.TestCase):
+    def test_get_retries_rate_limit_and_honors_retry_after(self):
+        limited = Mock(status_code=429, headers={"Retry-After": "2"})
+        limited.raise_for_status.side_effect = requests.HTTPError("rate limited")
+        success = Mock(status_code=200)
+
+        with (
+            patch.object(download_data.requests, "get", side_effect=[limited, success]) as get,
+            patch.object(download_data.time, "sleep") as sleep,
+        ):
+            response = download_data.get("https://example.test/data", {}, retries=2)
+
+        self.assertIs(response, success)
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
+    def test_get_returns_openfda_not_found_without_retry(self):
+        not_found = Mock(status_code=404)
+        with patch.object(download_data.requests, "get", return_value=not_found) as get:
+            response = download_data.get(download_data.OPENFDA_URL, {}, retries=2)
+
+        self.assertIs(response, not_found)
+        get.assert_called_once()
+        not_found.raise_for_status.assert_not_called()
+
+    def test_get_does_not_retry_permanent_http_error(self):
+        bad_request = Mock(status_code=400)
+        bad_request.raise_for_status.side_effect = requests.HTTPError("bad request")
+        with (
+            patch.object(download_data.requests, "get", return_value=bad_request) as get,
+            patch.object(download_data.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+                download_data.get("https://example.test/data", {}, retries=3)
+
+        get.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_get_does_not_expose_request_url_on_connection_failure(self):
+        error = requests.ConnectionError(
+            "connection failed for https://example.test/data?api_key=secret-sentinel"
+        )
+        with (
+            patch.object(download_data.requests, "get", side_effect=error),
+            patch.object(download_data.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ConnectionError") as raised:
+                download_data.get("https://example.test/data", {}, retries=1)
+
+        self.assertNotIn("secret-sentinel", str(raised.exception))
+
     def test_medlineplus_preserves_new_raw_query_snapshots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

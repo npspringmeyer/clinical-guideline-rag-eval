@@ -124,6 +124,36 @@ class UMLSClient:
         results = response.get("result", {}).get("results", [])
         return [result for result in results if result.get("ui") != "NONE"][:max_results]
 
+    def search_source(
+        self,
+        term: str,
+        source: str,
+        max_results: int = 10,
+        search_type: str = "exact",
+    ) -> list[dict]:
+        """Return source-asserted identifiers for a term from one vocabulary."""
+        if not term.strip():
+            raise ValueError("Search term cannot be empty")
+        if not source.strip():
+            raise ValueError("Source vocabulary cannot be empty")
+        if not 1 <= max_results <= 200:
+            raise ValueError("max_results must be between 1 and 200")
+        if search_type not in {"exact", "words"}:
+            raise ValueError("search_type must be 'exact' or 'words'")
+        response = self._get_json(
+            f"search/{quote(self.release, safe='')}",
+            {
+                "string": term,
+                "searchType": search_type,
+                "sabs": source,
+                "returnIdType": "code",
+                "pageNumber": 1,
+                "pageSize": max_results,
+            },
+        )
+        results = response.get("result", {}).get("results", [])
+        return [result for result in results if result.get("ui") != "NONE"][:max_results]
+
     def lookup_concept(
         self,
         cui: str,

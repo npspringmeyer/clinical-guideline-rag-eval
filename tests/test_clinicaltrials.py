@@ -172,6 +172,16 @@ class ClinicalTrialsTests(unittest.TestCase):
         self.assertEqual(page.payload, {"studies": []})
         sleep.assert_called_once_with(2.0)
 
+    def test_permanent_http_error_fails_without_retry(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({}, status_code=400)
+        client = ClinicalTrialsClient(session=session, retries=3, sleep=Mock())
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            client.fetch_page({}, 10)
+
+        session.get.assert_called_once()
+
     def test_study_document_retains_provenance_and_registration_caveat(self):
         document = study_to_document(sample_study(), "2025-04-04T00:00:00+00:00")
         self.assertEqual(document.doc_id, "ctg-NCT01234567")

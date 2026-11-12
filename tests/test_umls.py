@@ -62,6 +62,64 @@ class UMLSTests(unittest.TestCase):
         )
         self.assertEqual(result["relationships"][0]["relatedId"], "C2")
 
+    def test_source_search_requests_source_codes(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({"result": {"results": [
+            {"ui": "6809", "name": "metformin", "rootSource": "RXNORM"},
+            {"ui": "NONE", "name": "No result"},
+        ]}})
+        client = UMLSClient(api_key="test-key", session=session)
+
+        results = client.search_source("metformin", "RXNORM")
+
+        self.assertEqual([result["ui"] for result in results], ["6809"])
+        params = session.get.call_args.kwargs["params"]
+        self.assertEqual(params["sabs"], "RXNORM")
+        self.assertEqual(params["returnIdType"], "code")
+        self.assertEqual(params["searchType"], "exact")
+
+    def test_source_search_can_use_word_matching(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({"result": {"results": []}})
+        client = UMLSClient(api_key="test-key", session=session)
+
+        client.search_source("metformin", "RXNORM", search_type="words")
+
+        self.assertEqual(
+            session.get.call_args.kwargs["params"]["searchType"], "words"
+        )
+
+    def test_source_search_retries_rate_limit_and_server_error(self):
+        sleep = Mock()
+        session = Mock()
+        session.get.side_effect = [
+            FakeResponse({}, status_code=503, headers={"Retry-After": "2"}),
+            FakeResponse({}, status_code=429, headers={"Retry-After": "1"}),
+            FakeResponse({"result": {"results": [
+                {"ui": "6809", "name": "metformin", "rootSource": "RXNORM"},
+            ]}}),
+        ]
+        client = UMLSClient(
+            api_key="test-key", session=session, retries=3, sleep=sleep
+        )
+
+        results = client.search_source("metformin", "RXNORM")
+
+        self.assertEqual(results[0]["ui"], "6809")
+        self.assertEqual(sleep.call_args_list, [unittest.mock.call(2.0), unittest.mock.call(1.0)])
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_unauthorized_response_fails_without_retry_or_key_leak(self):
+        session = Mock()
+        session.get.return_value = FakeResponse({}, status_code=401)
+        client = UMLSClient(api_key="secret-sentinel", session=session, retries=3)
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401") as raised:
+            client.search("preeclampsia")
+
+        self.assertNotIn("secret-sentinel", str(raised.exception))
+        session.get.assert_called_once()
+
     def test_search_saves_exact_raw_response_without_api_key(self):
         response_body = b'{"result":{"results":[{"ui":"C123","name":"Example"}]}}'
         session = Mock()

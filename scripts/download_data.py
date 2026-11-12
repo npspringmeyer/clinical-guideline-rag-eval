@@ -144,18 +144,33 @@ def save_processed_document(document: Document, root: Path = ROOT) -> Path:
 
 
 def get(url: str, params: dict, retries: int = 3) -> requests.Response:
-    last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
-            if resp.status_code == 404 and "api.fda.gov" in url:
-                return resp  # openFDA uses 404 for "no matches"
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as err:
-            last_err = err
+        except requests.RequestException as error:
+            if attempt == retries:
+                raise RuntimeError(
+                    f"Request failed after {retries} tries ({type(error).__name__})"
+                ) from None
             time.sleep(1.5 * attempt)
-    raise RuntimeError(f"Request failed after {retries} tries: {last_err}")
+            continue
+
+        if resp.status_code == 404 and "api.fda.gov" in url:
+            return resp  # openFDA uses 404 for "no matches"
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt < retries:
+                retry_after = resp.headers.get("Retry-After", "")
+                delay = float(retry_after) if retry_after.isdigit() else 1.5 * attempt
+                time.sleep(min(delay, 30))
+                continue
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            raise RuntimeError(
+                f"Request returned HTTP {resp.status_code}"
+            ) from None
+        return resp
+    raise RuntimeError("Request failed without a response")
 
 
 def clean_html(raw: str) -> str:

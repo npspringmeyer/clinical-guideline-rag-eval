@@ -41,6 +41,23 @@ python scripts/enrich_umls.py --query 'high blood pressure' \
   --include-synonyms --include-relationships --expand
 ```
 
+For corpus-scoped MeSH descriptors and RxNorm identifiers, run:
+
+```bash
+python scripts/fetch_terminologies.py
+```
+
+This searches the configured MedlinePlus query terms in MeSH (`MSH`) and the
+openFDA generic drug names in RxNorm (`RXNORM`). Use `--source MSH` or
+`--source RXNORM` to fetch one vocabulary, `--max-results` to set the per-term
+result limit, or `--search-type words` for broader matches (the default is
+exact matching). MeSH identifiers can support topic tagging and later
+literature searches; this command does not download literature. RxNorm
+identifiers and names provide medication terminology matches, without
+automatically selecting among ambiguous candidates. Exact API responses are
+stored under `data/raw/umls/`; processed records are written separately to
+`data/processed/umls/source_enrichment.jsonl`.
+
 Use `--release` to choose a UMLS release (default: `current`), and
 `--document-id` to associate results with source document IDs. Exact UMLS API
 JSON responses are saved under `data/raw/umls/` using filenames derived from
@@ -81,7 +98,7 @@ metadata, not misrepresented as an update date).
 Clinical trial registrations and any reported registry results are explicitly
 identified as registry information, not published evidence or proof of
 treatment effectiveness. UMLS results are stored separately and must not be
-treated as evidence documents. The four public-source integrations can
+treated as evidence documents. These public-source integrations can
 therefore be inspected and validated before any embedding or indexing work.
 
 ## Tests
